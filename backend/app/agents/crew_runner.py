@@ -1,16 +1,22 @@
 import json
 import httpx
-from typing import List, Optional, Dict, Any
+import time
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 
 from ..schemas.models import MindMapSpec, MindMapNode, generate_id
 from ..config import get_settings
+from ..services.loki_logger import loki_logger, AgentLogType
 
 
 class CrewRunner:
     def __init__(self):
         self.settings = get_settings()
         self.ollama_url = f"{self.settings.ollama_host}/api/generate"
+        self.llm_call_count = 0
+        self.current_job_id: Optional[str] = None
+        self.current_section_id: Optional[str] = None
+        self.current_section_title: Optional[str] = None
     
     async def _call_ollama(self, prompt: str, system_prompt: str = "") -> str:
         try:
@@ -38,11 +44,30 @@ class CrewRunner:
     
     async def extract_content(
         self,
+        job_id: str,
+        section_id: str,
         section_title: str,
         text_content: str,
         page_start: int,
         page_end: int,
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
+        start_time = time.time()
+        self.llm_call_count = 0
+        
+        await loki_logger.log_extractor_activity(
+            job_id=job_id,
+            section_id=section_id,
+            section_title=section_title,
+            page_start=page_start,
+            page_end=page_end,
+            action="Starting content extraction",
+            reasoning=f"Analyzing {page_end - page_start + 1} pages to identify key concepts, relationships, and hierarchies. Will extract main topics, subtopics, and supporting details with page citations.",
+            metrics={
+                "text_length": len(text_content),
+                "page_count": page_end - page_start + 1,
+            },
+        )
+        
         system_prompt = """You are an expert content extractor and summarizer. 
 Your task is to extract key concepts, relationships, and hierarchies from document sections.
 Output should be structured as bullet points with page citations where applicable.
@@ -65,14 +90,91 @@ Please provide:
 
 Format as structured bullet points."""
 
+        extraction_method = "llm"
+        extracted_concepts = []
+        
         try:
+            self.llm_call_count += 1
             response = await self._call_ollama(prompt, system_prompt)
             if response and len(response) > 50:
-                return response
-        except Exception:
-            pass
+                extracted_concepts = self._extract_concepts_from_response(response)
+                
+                await loki_logger.log_extractor_activity(
+                    job_id=job_id,
+                    section_id=section_id,
+                    section_title=section_title,
+                    page_start=page_start,
+                    page_end=page_end,
+                    action="LLM extraction completed successfully",
+                    reasoning=f"Successfully extracted {len(extracted_concepts)} concepts from the section using Ollama LLM. The extraction identified main topics and their relationships.",
+                    extracted_concepts=extracted_concepts,
+                    metrics={
+                        "response_length": len(response),
+                        "concept_count": len(extracted_concepts),
+                        "extraction_time_ms": (time.time() - start_time) * 1000,
+                    },
+                )
+                
+                extraction_metrics = {
+                    "method": extraction_method,
+                    "llm_calls": self.llm_call_count,
+                    "concept_count": len(extracted_concepts),
+                    "extraction_time_ms": (time.time() - start_time) * 1000,
+                }
+                return response, extraction_metrics
+        except Exception as e:
+            await loki_logger.log_agent_activity(
+                agent_name="Extractor",
+                log_type=AgentLogType.ERROR,
+                job_id=job_id,
+                section_id=section_id,
+                section_title=section_title,
+                message=f"LLM extraction failed: {str(e)}",
+                reasoning="Falling back to rule-based extraction due to LLM error",
+                level="WARNING",
+            )
         
-        return self._generate_fallback_extraction(section_title, text_content, page_start, page_end)
+        extraction_method = "fallback"
+        result = self._generate_fallback_extraction(section_title, text_content, page_start, page_end)
+        extracted_concepts = self._extract_concepts_from_response(result)
+        
+        await loki_logger.log_extractor_activity(
+            job_id=job_id,
+            section_id=section_id,
+            section_title=section_title,
+            page_start=page_start,
+            page_end=page_end,
+            action="Fallback extraction completed",
+            reasoning="Used rule-based extraction to identify key sentences and concepts from the text. This method parses the document structure and extracts meaningful phrases.",
+            extracted_concepts=extracted_concepts,
+            metrics={
+                "concept_count": len(extracted_concepts),
+                "extraction_time_ms": (time.time() - start_time) * 1000,
+            },
+        )
+        
+        extraction_metrics = {
+            "method": extraction_method,
+            "llm_calls": self.llm_call_count,
+            "concept_count": len(extracted_concepts),
+            "extraction_time_ms": (time.time() - start_time) * 1000,
+        }
+        return result, extraction_metrics
+    
+    def _extract_concepts_from_response(self, response: str) -> List[str]:
+        concepts = []
+        for line in response.split('\n'):
+            line = line.strip()
+            if line.startswith('- ') or line.startswith('* ') or line.startswith('• '):
+                concept = line[2:].strip()
+                if len(concept) > 5:
+                    concepts.append(concept[:100])
+            elif line and len(line) > 10 and len(line) < 150:
+                if any(line.startswith(f"{i}.") for i in range(1, 10)):
+                    concept = line.split('.', 1)[1].strip() if '.' in line else line
+                    if len(concept) > 5:
+                        concepts.append(concept[:100])
+        return concepts[:20]
     
     def _generate_fallback_extraction(
         self,
@@ -113,7 +215,21 @@ Supporting Details:
         section_id: str,
         section_title: str,
         extracted_content: str,
-    ) -> MindMapSpec:
+    ) -> Tuple[MindMapSpec, Dict[str, Any]]:
+        start_time = time.time()
+        llm_calls = 0
+        
+        await loki_logger.log_builder_activity(
+            job_id=job_id,
+            section_id=section_id,
+            section_title=section_title,
+            action="Starting mind map construction",
+            reasoning=f"Transforming extracted content into hierarchical mind map structure. Will create a balanced tree with root node, 3-7 main branches, and 2-4 sub-branches per main branch.",
+            metrics={
+                "content_length": len(extracted_content),
+            },
+        )
+        
         system_prompt = """You are an expert mind map architect.
 Your task is to transform extracted content into a hierarchical mind map structure.
 Create a balanced tree with clear parent-child relationships.
@@ -143,15 +259,115 @@ Requirements:
 
 Output only valid JSON, no other text."""
 
+        build_method = "llm"
+        
         try:
+            llm_calls += 1
             response = await self._call_ollama(prompt, system_prompt)
             mindmap = self._parse_mindmap_response(job_id, section_id, section_title, response)
             if mindmap and len(mindmap.nodes) >= 3:
-                return mindmap
-        except Exception:
-            pass
+                generation_time = (time.time() - start_time) * 1000
+                
+                level_counts = {}
+                for node in mindmap.nodes:
+                    level_counts[node.level] = level_counts.get(node.level, 0) + 1
+                
+                max_depth = max(n.level for n in mindmap.nodes) if mindmap.nodes else 0
+                branch_count = level_counts.get(1, 0)
+                has_citations = any(n.citations for n in mindmap.nodes)
+                
+                await loki_logger.log_builder_activity(
+                    job_id=job_id,
+                    section_id=section_id,
+                    section_title=section_title,
+                    action="LLM mind map construction completed",
+                    reasoning=f"Successfully built hierarchical mind map with {len(mindmap.nodes)} nodes. Structure has {branch_count} main branches (level 1) and maximum depth of {max_depth}. {'Includes page citations.' if has_citations else 'No page citations found.'}",
+                    node_count=len(mindmap.nodes),
+                    depth=max_depth,
+                    structure_summary={
+                        "level_distribution": level_counts,
+                        "branch_count": branch_count,
+                        "has_citations": has_citations,
+                    },
+                    metrics={
+                        "generation_time_ms": generation_time,
+                        "llm_calls": llm_calls,
+                    },
+                )
+                
+                await loki_logger.log_mindmap_generation_summary(
+                    job_id=job_id,
+                    section_id=section_id,
+                    section_title=section_title,
+                    total_nodes=len(mindmap.nodes),
+                    max_depth=max_depth,
+                    branch_count=branch_count,
+                    has_citations=has_citations,
+                    generation_time_ms=generation_time,
+                    llm_calls=llm_calls,
+                )
+                
+                build_metrics = {
+                    "method": build_method,
+                    "llm_calls": llm_calls,
+                    "node_count": len(mindmap.nodes),
+                    "max_depth": max_depth,
+                    "branch_count": branch_count,
+                    "generation_time_ms": generation_time,
+                }
+                return mindmap, build_metrics
+        except Exception as e:
+            await loki_logger.log_agent_activity(
+                agent_name="Builder",
+                log_type=AgentLogType.ERROR,
+                job_id=job_id,
+                section_id=section_id,
+                section_title=section_title,
+                message=f"LLM mind map construction failed: {str(e)}",
+                reasoning="Falling back to rule-based mind map generation due to LLM error",
+                level="WARNING",
+            )
         
-        return self._generate_fallback_mindmap(job_id, section_id, section_title, extracted_content)
+        build_method = "fallback"
+        mindmap = self._generate_fallback_mindmap(job_id, section_id, section_title, extracted_content)
+        generation_time = (time.time() - start_time) * 1000
+        
+        level_counts = {}
+        for node in mindmap.nodes:
+            level_counts[node.level] = level_counts.get(node.level, 0) + 1
+        
+        max_depth = max(n.level for n in mindmap.nodes) if mindmap.nodes else 0
+        branch_count = level_counts.get(1, 0)
+        has_citations = any(n.citations for n in mindmap.nodes)
+        
+        await loki_logger.log_builder_activity(
+            job_id=job_id,
+            section_id=section_id,
+            section_title=section_title,
+            action="Fallback mind map construction completed",
+            reasoning=f"Used rule-based construction to build mind map from extracted concepts. Created {len(mindmap.nodes)} nodes with {branch_count} main branches by parsing bullet points and key phrases from the extracted content.",
+            node_count=len(mindmap.nodes),
+            depth=max_depth,
+            structure_summary={
+                "level_distribution": level_counts,
+                "branch_count": branch_count,
+                "has_citations": has_citations,
+            },
+            metrics={
+                "generation_time_ms": generation_time,
+                "llm_calls": llm_calls,
+            },
+        )
+        
+        build_metrics = {
+            "method": build_method,
+            "llm_calls": llm_calls,
+            "node_count": len(mindmap.nodes),
+            "max_depth": max_depth,
+            "branch_count": branch_count,
+            "generation_time_ms": generation_time,
+        }
+        return mindmap, build_metrics
     
     def _parse_mindmap_response(
         self,
@@ -312,7 +528,18 @@ Output only valid JSON, no other text."""
         self,
         mindmap: MindMapSpec,
         issues: List[str],
-    ) -> MindMapSpec:
+        attempt_number: int = 1,
+    ) -> Tuple[MindMapSpec, bool]:
+        await loki_logger.log_repair_attempt(
+            job_id=mindmap.job_id,
+            section_id=mindmap.section_id,
+            section_title=mindmap.section_title,
+            attempt_number=attempt_number,
+            issues_to_fix=issues,
+            repair_strategy="LLM-based repair with targeted prompts",
+            success=False,
+        )
+        
         system_prompt = """You are an expert mind map repair specialist.
 Your task is to fix issues in mind map structures while preserving valid content.
 Output must be valid JSON matching the specified schema."""
@@ -354,6 +581,7 @@ Requirements:
 
 Output only valid JSON with the same structure, no other text."""
 
+        repair_method = "llm"
         try:
             response = await self._call_ollama(prompt, system_prompt)
             repaired = self._parse_mindmap_response(
@@ -364,11 +592,44 @@ Output only valid JSON with the same structure, no other text."""
             )
             if repaired and len(repaired.nodes) >= 3:
                 repaired.version = mindmap.version + 1
-                return repaired
-        except Exception:
-            pass
+                
+                await loki_logger.log_repair_attempt(
+                    job_id=mindmap.job_id,
+                    section_id=mindmap.section_id,
+                    section_title=mindmap.section_title,
+                    attempt_number=attempt_number,
+                    issues_to_fix=issues,
+                    repair_strategy="LLM-based repair successful",
+                    success=True,
+                )
+                
+                return repaired, True
+        except Exception as e:
+            await loki_logger.log_agent_activity(
+                agent_name="Builder",
+                log_type=AgentLogType.ERROR,
+                job_id=mindmap.job_id,
+                section_id=mindmap.section_id,
+                section_title=mindmap.section_title,
+                message=f"LLM repair failed: {str(e)}",
+                reasoning="Falling back to auto-repair algorithm",
+                level="WARNING",
+            )
         
-        return self._auto_repair_mindmap(mindmap, issues)
+        repair_method = "auto"
+        repaired = self._auto_repair_mindmap(mindmap, issues)
+        
+        await loki_logger.log_repair_attempt(
+            job_id=mindmap.job_id,
+            section_id=mindmap.section_id,
+            section_title=mindmap.section_title,
+            attempt_number=attempt_number,
+            issues_to_fix=issues,
+            repair_strategy=f"Auto-repair algorithm applied: fixed root nodes, orphan nodes, and minimum node count",
+            success=True,
+        )
+        
+        return repaired, True
     
     def _auto_repair_mindmap(
         self,

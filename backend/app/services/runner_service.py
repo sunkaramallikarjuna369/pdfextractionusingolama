@@ -16,6 +16,7 @@ from ..config import get_settings
 from .event_service import event_service
 from .job_service import job_service
 from .pdf_service import pdf_service
+from .loki_logger import loki_logger, AgentLogType
 from ..agents.crew_runner import CrewRunner
 
 
@@ -117,6 +118,19 @@ class RunnerService:
         if not job:
             return
         
+        await loki_logger.log_supervisor_decision(
+            job_id=job_id,
+            section_id=section.id,
+            section_title=section.title,
+            decision="process_section",
+            reasoning=f"Starting processing for section '{section.title}' (pages {section.page_start}-{section.page_end}). Will extract content first, then build mind map structure.",
+            factors={
+                "page_range": f"{section.page_start}-{section.page_end}",
+                "page_count": section.page_end - section.page_start + 1,
+                "section_level": section.level,
+            },
+        )
+        
         await event_service.emit(
             EventType.SECTION_STARTED,
             job_id=job_id,
@@ -146,8 +160,8 @@ class RunnerService:
                 job.pdf_id, section.page_start, section.page_end
             )
             
-            extracted_content = await self.crew_runner.extract_content(
-                section.title, text_content, section.page_start, section.page_end
+            extracted_content, extraction_metrics = await self.crew_runner.extract_content(
+                job_id, section.id, section.title, text_content, section.page_start, section.page_end
             )
             
             section.extracted_content = extracted_content
@@ -158,7 +172,8 @@ class RunnerService:
                 section_id=section.id,
                 agent_id="extractor",
                 agent_name="Extractor",
-                message="Content extraction completed",
+                message=f"Content extraction completed using {extraction_metrics.get('method', 'unknown')} method",
+                metadata=extraction_metrics,
             )
             
             await job_service.update_agent_status(
@@ -179,7 +194,7 @@ class RunnerService:
                 message="Building mind map structure",
             )
             
-            mindmap = await self.crew_runner.build_mindmap(
+            mindmap, build_metrics = await self.crew_runner.build_mindmap(
                 job_id, section.id, section.title, extracted_content
             )
             
@@ -189,7 +204,8 @@ class RunnerService:
                 section_id=section.id,
                 agent_id="builder",
                 agent_name="Builder",
-                message=f"Mind map built with {len(mindmap.nodes)} nodes",
+                message=f"Mind map built with {len(mindmap.nodes)} nodes using {build_metrics.get('method', 'unknown')} method",
+                metadata=build_metrics,
             )
             
             await job_service.update_agent_status(
@@ -198,7 +214,7 @@ class RunnerService:
             
             await job_service.update_section_status(section.id, SectionStatus.VALIDATING)
             
-            validation = await self._validate_mindmap(mindmap)
+            validation = await self._validate_mindmap(job_id, section.id, section.title, mindmap)
             
             if not validation.passed:
                 await event_service.emit(
@@ -221,11 +237,11 @@ class RunnerService:
                         message=f"Repair attempt {attempt + 1}",
                     )
                     
-                    mindmap = await self.crew_runner.repair_mindmap(
-                        mindmap, validation.issues
+                    mindmap, repair_success = await self.crew_runner.repair_mindmap(
+                        mindmap, validation.issues, attempt + 1
                     )
                     
-                    validation = await self._validate_mindmap(mindmap)
+                    validation = await self._validate_mindmap(job_id, section.id, section.title, mindmap)
                     
                     if validation.passed:
                         await event_service.emit(
@@ -237,6 +253,18 @@ class RunnerService:
                         break
                 
                 if not validation.passed:
+                    await loki_logger.log_agent_activity(
+                        agent_name="Supervisor",
+                        log_type=AgentLogType.DECISION,
+                        job_id=job_id,
+                        section_id=section.id,
+                        section_title=section.title,
+                        message="Section requires manual review",
+                        decision="needs_review",
+                        reasoning=f"Validation failed after {self.settings.max_repair_attempts} repair attempts. Issues: {', '.join(validation.issues)}",
+                        level="WARNING",
+                    )
+                    
                     await job_service.update_section_status(
                         section.id,
                         SectionStatus.NEEDS_REVIEW,
@@ -254,6 +282,21 @@ class RunnerService:
             await job_service.save_mindmap(section.id, mindmap)
             await job_service.update_section_status(section.id, SectionStatus.COMPLETED)
             
+            await loki_logger.log_supervisor_decision(
+                job_id=job_id,
+                section_id=section.id,
+                section_title=section.title,
+                decision="section_completed",
+                reasoning=f"Successfully completed mind map generation for '{section.title}'. Final mind map has {len(mindmap.nodes)} nodes with max depth {validation.max_depth}.",
+                factors={
+                    "node_count": len(mindmap.nodes),
+                    "max_depth": validation.max_depth,
+                    "has_citations": validation.has_citations,
+                    "extraction_method": extraction_metrics.get('method', 'unknown'),
+                    "build_method": build_metrics.get('method', 'unknown'),
+                },
+            )
+            
             await event_service.emit(
                 EventType.SECTION_COMPLETED,
                 job_id=job_id,
@@ -262,10 +305,23 @@ class RunnerService:
                 metadata={
                     "node_count": len(mindmap.nodes),
                     "max_depth": validation.max_depth,
+                    "extraction_metrics": extraction_metrics,
+                    "build_metrics": build_metrics,
                 },
             )
             
         except Exception as e:
+            await loki_logger.log_agent_activity(
+                agent_name="Supervisor",
+                log_type=AgentLogType.ERROR,
+                job_id=job_id,
+                section_id=section.id,
+                section_title=section.title,
+                message=f"Section processing failed: {str(e)}",
+                reasoning="An unexpected error occurred during section processing",
+                level="ERROR",
+            )
+            
             await job_service.update_section_status(
                 section.id, SectionStatus.FAILED, str(e)
             )
@@ -287,7 +343,7 @@ class RunnerService:
                 "builder", AgentStatus.IDLE, None, None
             )
     
-    async def _validate_mindmap(self, mindmap: MindMapSpec) -> ValidationResult:
+    async def _validate_mindmap(self, job_id: str, section_id: str, section_title: str, mindmap: MindMapSpec) -> ValidationResult:
         issues = []
         warnings = []
         
@@ -318,7 +374,7 @@ class RunnerService:
         if not has_citations:
             warnings.append("Mind map has no page citations")
         
-        return ValidationResult(
+        validation_result = ValidationResult(
             passed=len(issues) == 0,
             issues=issues,
             warnings=warnings,
@@ -326,6 +382,23 @@ class RunnerService:
             max_depth=max_depth,
             has_citations=has_citations,
         )
+        
+        await loki_logger.log_validation_result(
+            job_id=job_id,
+            section_id=section_id,
+            section_title=section_title,
+            passed=validation_result.passed,
+            issues=issues,
+            warnings=warnings,
+            metrics={
+                "node_count": len(mindmap.nodes),
+                "max_depth": max_depth,
+                "has_citations": has_citations,
+                "root_node_count": len(root_nodes),
+            },
+        )
+        
+        return validation_result
     
     def _calculate_depth(self, node: MindMapNode, all_nodes: list) -> int:
         depth = 0
