@@ -35,9 +35,16 @@ AI-powered PDF mind map generation system using CrewAI with a supervisor pattern
                          +----------------+
 ```
 
+## Platform Support
+
+This project supports both Linux/macOS and Windows:
+
+- **Linux/macOS**: Follow the instructions below
+- **Windows**: See [README.windows.md](README.windows.md) for Windows-specific setup with PowerShell scripts
+
 ## Prerequisites
 
-- Docker & Docker Compose
+- Docker & Docker Compose (or Docker Desktop on Windows)
 - Ollama (for local LLM)
 - Node.js 20+ (for local development)
 - Python 3.11+ (for local development)
@@ -221,9 +228,17 @@ pdfextractionusingolama/
 │   ├── prometheus.yml
 │   ├── loki-config.yml
 │   └── grafana/
+├── scripts/               # PowerShell helper scripts (Windows)
+│   ├── start.ps1
+│   ├── stop.ps1
+│   ├── pull-model.ps1
+│   ├── logs.ps1
+│   ├── status.ps1
+│   └── cleanup.ps1
 ├── docker-compose.yml
 ├── SYSTEM_DESIGN.md
-└── README.md
+├── README.md
+└── README.windows.md      # Windows setup guide
 ```
 
 ## License
